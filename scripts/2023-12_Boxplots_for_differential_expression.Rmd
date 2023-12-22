@@ -1,0 +1,267 @@
+---
+title: '2023-12 Boxplots for differential expression'
+subtitle: RE project
+output:
+  html_document:
+    df_print: paged
+    number_sections: false
+    toc: yes
+    toc_depth: '3'
+    toc_float: yes
+    code_folding: hide
+    theme: cosmo
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(survival)
+library(survminer)
+library(data.table)
+library(table1)
+library(reshape2)
+library(doParallel)
+library(foreach)
+library(DESeq2)
+library(limma)
+library(edgeR)
+library(kableExtra)
+source("config.R")
+
+
+
+```
+
+## Data Cleanup {.tabset}
+
+### 1. Normalizing counts
+
+```{r normalization}
+raw_counts <- readRDS(paste0(data_path,'/Data/RE_all_repFamily_1_raw_counts.RDS'))
+normal_counts <- calcNormFactors(raw_counts, method = 'RLE')
+normal_counts <- as.data.frame(cpm(normal_counts, normalized.lib.sizes=T))
+```
+
+### 2. Parsing through IDs
+
+```{r combine-ids}
+glioma_dt <- read.csv(paste0(data_path,"/Data/glioma_dt.csv"))
+glioma_dt <- data.table(glioma_dt)
+glioma_dt$case_submitter_id <- substr(glioma_dt$case_submitter_id, 6, 12)
+
+```
+
+### 3. Recoding gliomas
+
+
+```{r glioma_reclass}
+
+#GBMS
+glioma_dt$WHO2021_recode <- ifelse(glioma_dt$IDH =='WT', 'Glioblastoma, IDH-wt', 'Diffuse Glioma, IDH-mutant, NEC')
+
+#Oligos
+
+glioma_dt <- glioma_dt %>%
+  mutate(WHO2021_recode = ifelse(!is.na(x1p19q) & !is.na(IDH) & IDH == 'Mutant' & x1p19q == 'codel',
+                                 'Oligodendroglioma, IDH-mutant', WHO2021_recode))
+
+glioma_dt <- glioma_dt %>%
+  mutate(WHO2021_recode = ifelse(!is.na(IDH) & IDH == 'Mutant' & TERT == 'Mutant' & WHO2021_recode == 'Diffuse Glioma, IDH-mutant, NEC',
+                                 'Oligodendroglioma, IDH-mutant', WHO2021_recode))
+
+
+#Astros
+glioma_dt <- glioma_dt %>%
+  mutate(WHO2021_recode = ifelse(!is.na(IDH) & !is.na(ATRX.status) & IDH == 'Mutant' & ATRX.status == 'Mutant',
+                                 'Astrocytoma, IDH-mutant', WHO2021_recode))
+```
+
+
+
+```{r}
+
+count_ids <- c(colnames(normal_counts))
+count_ids <- substr(count_ids, 1, 7)
+
+glioma_ids <- glioma_dt$case_submitter_id
+
+glioma_counts <- normal_counts[, grepl(paste(glioma_ids, collapse ="|"), names(normal_counts))]
+glioma_counts <- t(glioma_counts)
+glioma_counts <- data.frame(glioma_counts)
+glioma_counts$IID <- rownames(glioma_counts)
+glioma_counts$IID <- rownames(glioma_counts)
+rownames(glioma_counts) <- NULL
+glioma_counts$IID <- substr(glioma_counts$IID, 1, 7)
+rm(list =c('normal_counts', 'raw_counts'))
+```
+
+
+
+```{r}
+
+glioma_surv <- merge(glioma_counts, glioma_dt, by.x="IID", by.y="case_submitter_id")
+glioma_surv$who_grade <- glioma_surv$Grade
+
+glioma_surv$who_grade <- ifelse(glioma_surv$WHO2021_recode == "Glioblastoma, IDH-wt", "G4", glioma_surv$who_grade)
+
+glioma_surv$WHO2021_integrated <- paste(glioma_surv$WHO2021_recode, glioma_surv$who_grade, sep=", ")
+
+num_columns <- sapply(glioma_counts, is.numeric)
+
+```
+
+### Perecentile function
+
+```{r percentile-function}
+is_in_top_percentile <- function(x, p) {
+  top_percentile <- quantile(x, p, na.rm = TRUE)
+  ifelse(x >= top_percentile, 1, 0)
+}
+
+
+```
+
+### Geno's tertile function
+
+```{r}
+# Function to group into low mid and high groups
+
+percent_groups <- function(x, p_lower, p_upper) {
+  
+  low_thresh <- quantile(x, p_lower, na.rm = TRUE)
+  high_thresh <- quantile(x,p_upper, na.rm=TRUE)
+  
+  group_labs=c(paste("low: ", "(0% -", p_lower*100, "%)", sep = ""), paste("med: ", "(",p_lower*100,"% -", p_upper*100, "%)", sep = ""), paste("high: ", "(",p_upper*100,"% -100%)", sep = "") )
+  
+  grouped = ifelse(x <= low_thresh, group_labs[1], group_labs[2])
+  grouped[which(x > high_thresh)] = group_labs[3]
+  
+  grouped = factor(grouped, levels=group_labs)
+  return(grouped)
+}
+```
+
+
+### 4. Subsetting by Project ID
+
+```{r, echo=TRUE, warning=FALSE}
+
+tcga_gbm <- subset(glioma_surv, project_id=='TCGA-GBM')
+
+tcga_lgg <- subset(glioma_surv, project_id== 'TCGA-LGG')
+
+```
+
+
+
+## Survival models subset by Project ID {.tabset}
+
+**There are 26 miclassified cases in the GBM project** 
+
+```{r eval=TRUE}
+
+table(tcga_gbm$WHO2021_recode)
+
+```
+
+**There are 97 misclassified cases in the LGG project** 
+
+```{r}
+
+table(tcga_lgg$WHO2021_recode)
+
+```
+
+
+```{r}
+
+
+#diagnosis_data_frames <- lapply(unique_diagnoses, function(diagnosis) {
+#  subset_gliomas <- subset(glioma_surv, WHO2021_recode == diagnosis)
+#  return(subset_gliomas)
+#})
+
+
+gbm_df <- subset(glioma_surv, glioma_surv$WHO2021_recode == 'Glioblastoma, IDH-wt' )
+astro_df <- subset(glioma_surv, glioma_surv$WHO2021_recode == 'Astrocytoma, IDH-mutant' )
+oligo_df <- subset(glioma_surv, glioma_surv$WHO2021_recode == 'Oligodendroglioma, IDH-mutant' )
+diff_glio_df <- subset(glioma_surv, glioma_surv$WHO2021_recode == 'Diffuse Glioma, IDH-mutant, NEC' )
+
+#tcga_lgg <- subset(tcga_lgg, tcga_lgg$WHO2021_recode != 'Glioblastoma, IDH-wt' )
+
+#retroelements <- c(names(glioma_counts[, num_columns]))
+
+```
+
+## Box Plots {.tabset}
+### Differential counts of GBM (recoded) by project ID
+
+```{r}
+ggplot(gbm_df, aes(x = project_id, y = Alu, fill=project_id)) +
+  geom_boxplot() +
+  labs(title = "ALU Counts by project (within GBM)", x = "Project", y = "RNA Sequencing Counts")
+
+
+```
+
+```{r}
+
+create_boxplot <- function(data, y_variable) {
+  box_plot <- ggplot(data, aes(x = project_id, y = data[[y_variable]], fill = project_id)) +
+    geom_boxplot() +
+    labs(title = paste(toupper(y_variable), "Counts by project"),
+         x = "Project",
+         y = "RNA Sequencing Counts") 
+  print(box_plot)
+}
+
+```
+
+```{r}
+
+for (re in names(num_columns)[1:49]){ #To exclude the IID column
+  
+  box_plot <- create_boxplot(gbm_df, re)
+  
+}
+
+```
+
+
+### Differential counts of Astros (recoded) by project ID
+
+```{r}
+
+for (re in names(num_columns)[1:49]){
+  
+  box_plot <- create_boxplot(astro_df, re)
+  
+}
+
+```
+
+### Differential counts of Oligos (recoded) by project ID
+
+```{r}
+
+for (re in names(num_columns)[1:49]){
+  
+  box_plot <- create_boxplot(astro_df, re)
+  
+}
+
+```
+
+
+### Differential counts of DIffuse glioma NEC (recoded) by project ID
+
+```{r}
+
+for (re in names(num_columns)[1:49]){
+  
+  box_plot <- create_boxplot(diff_glio_df, re)
+  
+}
+
+```
