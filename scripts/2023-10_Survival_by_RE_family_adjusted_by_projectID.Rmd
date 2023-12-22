@@ -1,0 +1,310 @@
+---
+title: '2023-10 Survival by RE Family Adjusted by Project ID'
+subtitle: RE project
+output:
+  html_document:
+    df_print: paged
+    number_sections: false
+    toc: yes
+    toc_depth: '3'
+    toc_float: yes
+    code_folding: hide
+    theme: cosmo
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(survival)
+library(survminer)
+library(data.table)
+library(table1)
+library(reshape2)
+library(doParallel)
+library(foreach)
+library(DESeq2)
+library(limma)
+library(edgeR)
+library(kableExtra)
+source("config.R")
+
+```
+
+## Data Cleanup {.tabset}
+
+### 1. Normalizing counts
+
+```{r normalization}
+raw_counts <- readRDS(paste0(data_path,'/Data/RE_all_repFamily_1_raw_counts.RDS'))
+normal_counts <- calcNormFactors(raw_counts, method = 'RLE')
+normal_counts <- as.data.frame(cpm(normal_counts, normalized.lib.sizes=T))
+```
+
+### 2. Parsing through IDs
+
+```{r combine-ids}
+glioma_dt <- read.csv(paste0(data_path,"/Data/glioma_dt.csv"))
+glioma_dt <- data.table(glioma_dt)
+glioma_dt$case_submitter_id <- substr(glioma_dt$case_submitter_id, 6, 12)
+
+```
+
+### 3. Recoding gliomas
+
+
+```{r glioma_reclass}
+
+#GBMS
+glioma_dt$WHO2021_recode <- ifelse(glioma_dt$IDH =='WT', 'Glioblastoma, IDH-wt', 'Diffuse Glioma, IDH-mutant, NEC')
+
+#Oligos
+
+glioma_dt <- glioma_dt %>%
+  mutate(WHO2021_recode = ifelse(!is.na(x1p19q) & !is.na(IDH) & IDH == 'Mutant' & x1p19q == 'codel',
+                                 'Oligodendroglioma, IDH-mutant', WHO2021_recode))
+
+glioma_dt <- glioma_dt %>%
+  mutate(WHO2021_recode = ifelse(!is.na(IDH) & IDH == 'Mutant' & TERT == 'Mutant' & WHO2021_recode == 'Diffuse Glioma, IDH-mutant, NEC',
+                                 'Oligodendroglioma, IDH-mutant', WHO2021_recode))
+
+
+#Astros
+glioma_dt <- glioma_dt %>%
+  mutate(WHO2021_recode = ifelse(!is.na(IDH) & !is.na(ATRX.status) & IDH == 'Mutant' & ATRX.status == 'Mutant',
+                                 'Astrocytoma, IDH-mutant', WHO2021_recode))
+```
+
+
+
+```{r}
+
+count_ids <- c(colnames(normal_counts))
+count_ids <- substr(count_ids, 1, 7)
+
+glioma_ids <- glioma_dt$case_submitter_id
+
+glioma_counts <- normal_counts[, grepl(paste(glioma_ids, collapse ="|"), names(normal_counts))]
+glioma_counts <- t(glioma_counts)
+glioma_counts <- data.frame(glioma_counts)
+glioma_counts$IID <- rownames(glioma_counts)
+glioma_counts$IID <- rownames(glioma_counts)
+rownames(glioma_counts) <- NULL
+glioma_counts$IID <- substr(glioma_counts$IID, 1, 7)
+rm(list =c('normal_counts', 'raw_counts'))
+```
+
+
+
+```{r}
+
+glioma_surv <- merge(glioma_counts, glioma_dt, by.x="IID", by.y="case_submitter_id")
+num_columns <- sapply(glioma_counts, is.numeric)
+
+```
+
+### Perecentile function
+
+```{r percentile-function}
+is_in_top_percentile <- function(x, p) {
+  top_percentile <- quantile(x, p, na.rm = TRUE)
+  ifelse(x >= top_percentile, 1, 0)
+}
+
+
+```
+
+### Geno's tertile function
+
+```{r}
+# Function to group into low mid and high groups
+
+percent_groups <- function(x, p_lower, p_upper) {
+  
+  low_thresh <- quantile(x, p_lower, na.rm = TRUE)
+  high_thresh <- quantile(x,p_upper, na.rm=TRUE)
+  
+  group_labs=c(paste("low: ", "(0% -", p_lower*100, "%)", sep = ""), paste("med: ", "(",p_lower*100,"% -", p_upper*100, "%)", sep = ""), paste("high: ", "(",p_upper*100,"% -100%)", sep = "") )
+  
+  grouped = ifelse(x <= low_thresh, group_labs[1], group_labs[2])
+  grouped[which(x > high_thresh)] = group_labs[3]
+  
+  grouped = factor(grouped, levels=group_labs)
+  return(grouped)
+}
+```
+
+
+### 4. Subsetting by Project ID
+
+```{r, echo=TRUE, warning=FALSE}
+
+tcga_gbm <- subset(glioma_surv, project_id=='TCGA-GBM')
+
+tcga_lgg <- subset(glioma_surv, project_id== 'TCGA-LGG')
+
+```
+
+
+
+## Survival models subset by Project ID {.tabset}
+
+**There are 26 miclassified cases in the GBM project** 
+
+```{r eval=TRUE}
+
+table(tcga_gbm$WHO2021_recode)
+
+```
+
+**There are 97 misclassified cases in the LGG project** 
+
+```{r}
+
+table(tcga_lgg$WHO2021_recode)
+
+```
+
+
+```{r}
+
+tcga_gbm <- subset(tcga_gbm, tcga_gbm$WHO2021_recode == 'Glioblastoma, IDH-wt' )
+
+tcga_lgg <- subset(tcga_lgg, tcga_lgg$WHO2021_recode != 'Glioblastoma, IDH-wt' )
+
+retroelements <- c(names(glioma_counts[, num_columns]))
+
+```
+
+
+```{r, echo=FALSE}
+#deleting objects that will not be used to free memory
+suppressWarnings({rm(list =c('glioma_subsets', 'glioma_surv', 'glioma_counts', 'subtype_list'))})
+```
+
+## Models {.tabset}
+
+### TCGA Low Grade Glioma
+
+```{r}
+lgg_re_coefs <- data.frame(re = character(), coef= numeric(), exp_coef = numeric(), se_coef = numeric(), z= numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+lgg_model_list <- list()
+
+suppressWarnings({for (re in retroelements) { 
+  base_formula <- as.formula(paste0("Surv(Survival_months, Vital_status) ~ Age + sex + race + WHO2021_recode + ", re))
+  surv_model <- coxph(base_formula, data = tcga_lgg)
+  p_value <- summary(surv_model)$coefficients[40]
+  
+  
+  if (!is.na(p_value) && p_value <= 0.051) {
+        coef <- summary(surv_model)$coefficients[8]
+        exp_coef <- summary(surv_model)$coefficients[16]
+        se_coef <- summary(surv_model)$coefficients[24]
+        z <- summary(surv_model)$coefficients[32]
+        lgg_re_coefs <- rbind(lgg_re_coefs, data.frame(re = re, coef = coef, exp_coef = exp_coef, se_coef = se_coef, z = z, p_value = p_value))
+        lgg_model_list[[re]] <- surv_model
+ 
+  
+  }
+}
+})
+
+lgg_re_coefs <- lgg_re_coefs[order(lgg_re_coefs$p_value), ]
+
+lgg_re_coefs
+
+```
+
+
+### TCGA-Glioblastoma
+
+```{r}
+gbm_re_coefs <- data.frame(re = character(), coef= numeric(), exp_coef = numeric(), se_coef = numeric(), z= numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+gbm_model_list <- list()
+
+suppressWarnings({for (re in retroelements) { 
+  base_formula <- as.formula(paste0("Surv(Survival_months, Vital_status) ~ Age + sex + race + ", re))
+  surv_model <- coxph(base_formula, data = tcga_gbm)
+  p_value <- summary(surv_model)$coefficients[30]
+  
+  if (!is.na(p_value) && p_value <= 0.051) {
+        coef <- summary(surv_model)$coefficients[6]
+        exp_coef <- summary(surv_model)$coefficients[12]
+        se_coef <- summary(surv_model)$coefficients[18]
+        z <- summary(surv_model)$coefficients[24]
+        gbm_re_coefs <- rbind(gbm_re_coefs, 
+                              data.frame(re = re, coef = coef, exp_coef = exp_coef, se_coef = se_coef, z = z, p_value = p_value))
+        gbm_model_list[[re]] <- surv_model
+
+  
+  }
+}
+})
+
+gbm_re_coefs <- gbm_re_coefs[order(gbm_re_coefs$p_value), ]
+
+gbm_re_coefs
+
+```
+
+
+
+## Plots {.tabset}
+
+
+### TCGA Low Grade Glioma Project
+
+```{r tcga_lgg_plot , echo=FALSE, fig.width=8, fig.height = 6 }
+lgg_plots_list <- list()
+lgg_re_list <- lgg_re_coefs$re
+  #df <- coefs$re_coefs
+  
+for (re in lgg_re_list) {
+  #re <- re_list[i,1]
+  tcga_lgg$tertile_count <- as.factor(percent_groups(tcga_lgg[re], 0.33, 0.66))
+    
+  surv_obj <- Surv(tcga_lgg$Survival_months, tcga_lgg$Vital_status)
+    
+  km_curve <- surv_fit(surv_obj ~ tertile_count, data = tcga_lgg)
+  plot <- ggsurvplot(km_curve, data = tcga_lgg, 
+                       pval = TRUE, conf.int = TRUE, 
+                       font.x = 7,
+                       risk.table=TRUE, risk.table.fontsize = 4, risk.table.height=0.3,
+                       title = paste0("KM Curve for ", re))
+    
+  lgg_plots_list[[re]] <- plot
+  print(re)
+  print(xtabs( ~ WHO2021_recode + tertile_count, data=tcga_lgg))
+  print(plot)
+}
+
+```
+
+### TCGA GBM project
+```{r tcga_gbm_plot , echo=FALSE, fig.width=8, fig.height = 6 }
+gbm_plots_list <- list()
+gbm_re_list <- gbm_re_coefs$re
+  #df <- coefs$re_coefs
+  
+for (re in gbm_re_list) {
+  #re <- re_list[i,1]
+  tcga_gbm$tertile_count <- as.factor(percent_groups(tcga_gbm[re], 0.33, 0.66))
+    
+  surv_obj <- Surv(tcga_gbm$Survival_months, tcga_gbm$Vital_status)
+    
+  km_curve <- surv_fit(surv_obj ~ tertile_count, data = tcga_gbm)
+  plot <- ggsurvplot(km_curve, data = tcga_gbm, 
+                       pval = TRUE, conf.int = TRUE, 
+                       font.x = 7,
+                       risk.table=TRUE, risk.table.fontsize = 4, risk.table.height=0.3,
+                       title = paste0("KM Curve for ", re))
+    
+  gbm_plots_list[[re]] <- plot
+  print(re)
+  print(xtabs( ~ WHO2021_recode + tertile_count, data=tcga_gbm))
+  print(plot)
+}
+
+```
+
+
