@@ -1,0 +1,428 @@
+---
+title: '2023-12 Survival by "Pure" groups'
+subtitle: RE project
+output:
+  html_document:
+    df_print: paged
+    number_sections: false
+    toc: yes
+    toc_depth: '3'
+    toc_float: yes
+    code_folding: hide
+    theme: cosmo
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(survival)
+library(survminer)
+library(data.table)
+library(table1)
+library(reshape2)
+library(doParallel)
+library(foreach)
+library(DESeq2)
+library(limma)
+library(edgeR)
+library(kableExtra)
+
+source("config.R")
+
+
+```
+
+## Data Cleanup {.tabset}
+
+### 1. Normalizing counts
+
+```{r normalization}
+raw_counts <- readRDS(paste0(data_path,'/RE_all_repFamily_1_raw_counts.RDS'))
+normal_counts <- calcNormFactors(raw_counts, method = 'RLE')
+normal_counts <- as.data.frame(cpm(normal_counts, normalized.lib.sizes=T))
+```
+
+### 2. Parsing through IDs
+
+```{r combine-ids}
+glioma_dt <- read.csv(paste0(data_path,"glioma_dt.csv"))
+glioma_dt <- data.table(glioma_dt)
+glioma_dt$case_submitter_id <- substr(glioma_dt$case_submitter_id, 6, 12)
+
+```
+
+### 3. Recoding gliomas
+
+
+```{r glioma_reclass}
+
+#GBMS
+glioma_dt$WHO2021_recode <- ifelse(glioma_dt$IDH =='WT', 'Glioblastoma, IDH-wt', 'Diffuse Glioma, IDH-mutant, NEC')
+
+#Oligos
+
+glioma_dt <- glioma_dt %>%
+  mutate(WHO2021_recode = ifelse(!is.na(x1p19q) & !is.na(IDH) & IDH == 'Mutant' & x1p19q == 'codel',
+                                 'Oligodendroglioma, IDH-mutant', WHO2021_recode))
+
+glioma_dt <- glioma_dt %>%
+  mutate(WHO2021_recode = ifelse(!is.na(IDH) & IDH == 'Mutant' & TERT == 'Mutant' & WHO2021_recode == 'Diffuse Glioma, IDH-mutant, NEC',
+                                 'Oligodendroglioma, IDH-mutant', WHO2021_recode))
+
+
+#Astros
+glioma_dt <- glioma_dt %>%
+  mutate(WHO2021_recode = ifelse(!is.na(IDH) & !is.na(ATRX.status) & IDH == 'Mutant' & ATRX.status == 'Mutant',
+                                 'Astrocytoma, IDH-mutant', WHO2021_recode))
+```
+
+
+
+```{r}
+
+count_ids <- c(colnames(normal_counts))
+count_ids <- substr(count_ids, 1, 7)
+
+glioma_ids <- glioma_dt$case_submitter_id
+
+glioma_counts <- normal_counts[, grepl(paste(glioma_ids, collapse ="|"), names(normal_counts))]
+glioma_counts <- t(glioma_counts)
+glioma_counts <- data.frame(glioma_counts)
+glioma_counts$IID <- rownames(glioma_counts)
+glioma_counts$IID <- rownames(glioma_counts)
+rownames(glioma_counts) <- NULL
+glioma_counts$IID <- substr(glioma_counts$IID, 1, 7)
+rm(list =c('normal_counts', 'raw_counts'))
+```
+
+
+
+```{r}
+
+glioma_surv <- merge(glioma_counts, glioma_dt, by.x="IID", by.y="case_submitter_id")
+glioma_surv$who_grade <- glioma_surv$Grade
+
+glioma_surv$who_grade <- ifelse(glioma_surv$WHO2021_recode == "Glioblastoma, IDH-wt", "G4", glioma_surv$who_grade)
+
+glioma_surv$WHO2021_integrated <- paste(glioma_surv$WHO2021_recode, glioma_surv$who_grade, sep=", ")
+
+num_columns <- sapply(glioma_counts, is.numeric)
+
+```
+
+### Perecentile function
+
+```{r percentile-function}
+is_in_top_percentile <- function(x, p) {
+  top_percentile <- quantile(x, p, na.rm = TRUE)
+  ifelse(x >= top_percentile, 1, 0)
+}
+
+
+```
+
+### Geno's tertile function
+
+```{r}
+# Function to group into low mid and high groups
+
+percent_groups <- function(x, p_lower, p_upper) {
+  
+  low_thresh <- quantile(x, p_lower, na.rm = TRUE)
+  high_thresh <- quantile(x,p_upper, na.rm=TRUE)
+  
+  group_labs=c(paste("low: ", "(0% -", p_lower*100, "%)", sep = ""), paste("med: ", "(",p_lower*100,"% -", p_upper*100, "%)", sep = ""), paste("high: ", "(",p_upper*100,"% -100%)", sep = "") )
+  
+  grouped = ifelse(x <= low_thresh, group_labs[1], group_labs[2])
+  grouped[which(x > high_thresh)] = group_labs[3]
+  
+  grouped = factor(grouped, levels=group_labs)
+  return(grouped)
+}
+```
+
+
+
+### 4. Subsetting Data
+
+In this part we are going to keep only those samples that are:
+* IDH-wildtype GBM **AND** are labeled as glioblastoma in the `project_id` column.
+* IDH mutant glioma **AND** are labeled as low grade glioma in the `project_id` column
+
+```{r, echo=TRUE, warning=FALSE}
+
+gbm_df <- subset(glioma_surv, glioma_surv$WHO2021_recode == 'Glioblastoma, IDH-wt' & glioma_surv$project_id=='TCGA-GBM')
+astro_df <- subset(glioma_surv, glioma_surv$WHO2021_recode == 'Astrocytoma, IDH-mutant' & glioma_surv$project_id=='TCGA-LGG')
+oligo_df <- subset(glioma_surv, glioma_surv$WHO2021_recode == 'Oligodendroglioma, IDH-mutant' )
+glionec_df <- subset(glioma_surv, glioma_surv$WHO2021_recode == 'Diffuse Glioma, IDH-mutant, NEC'  & glioma_surv$project_id=='TCGA-LGG')
+
+retroelements <- c(names(glioma_counts[, num_columns]))
+print(table(gbm_df$project_id))
+print(table(oligo_df$project_id))
+print(table(astro_df$project_id))
+print(table(glionec_df$project_id))
+
+
+
+```
+
+
+
+## Survival models subset by Gliomasubtype {.tabset}
+
+
+```{r, echo=FALSE}
+#deleting objects that will not be used to free memory
+suppressWarnings({rm(list =c('glioma_subsets', 'glioma_surv', 'glioma_counts', 'subtype_list'))})
+```
+
+## Models {.tabset}
+
+### Oligodendrogliomas
+
+```{r}
+oligo_re_coefs <- data.frame(re = character(), coef= numeric(), exp_coef = numeric(), se_coef = numeric(), z= numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+oligo_model_list <- list()
+
+suppressWarnings({for (re in retroelements) { 
+  base_formula <- as.formula(paste0("Surv(Survival_months, Vital_status) ~ Age + sex + race + who_grade + ", re))
+  surv_model <- coxph(base_formula, data = oligo_df)
+  p_value <- summary(surv_model)$coefficients[35]
+  
+  
+  if (!is.na(p_value) && p_value <= 0.051) {
+        coef <- summary(surv_model)$coefficients[7]
+        exp_coef <- summary(surv_model)$coefficients[14]
+        se_coef <- summary(surv_model)$coefficients[21]
+        z <- summary(surv_model)$coefficients[28]
+        oligo_re_coefs <- rbind(oligo_re_coefs, data.frame(re = re, coef = coef, exp_coef = exp_coef, se_coef = se_coef, z = z, p_value = p_value))
+        oligo_model_list[[re]] <- surv_model
+ 
+  
+  }
+}
+})
+
+oligo_re_coefs <- oligo_re_coefs[order(oligo_re_coefs$p_value), ]
+
+oligo_re_coefs
+
+```
+
+
+### Astrocytomas
+
+```{r}
+astro_re_coefs <- data.frame(re = character(), coef= numeric(), exp_coef = numeric(), se_coef = numeric(), z= numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+astro_model_list <- list()
+
+suppressWarnings({for (re in retroelements) { 
+  base_formula <- as.formula(paste0("Surv(Survival_months, Vital_status) ~ Age + sex + race + who_grade + ", re))
+  surv_model <- coxph(base_formula, data = astro_df)
+  p_value <- summary(surv_model)$coefficients[30]
+  
+  
+  if (!is.na(p_value) && p_value <= 0.051) {
+        coef <- summary(surv_model)$coefficients[6]
+        exp_coef <- summary(surv_model)$coefficients[12]
+        se_coef <- summary(surv_model)$coefficients[18]
+        z <- summary(surv_model)$coefficients[24]
+        astro_re_coefs <- rbind(astro_re_coefs, data.frame(re = re, coef = coef, exp_coef = exp_coef, se_coef = se_coef, z = z, p_value = p_value))
+        astro_model_list[[re]] <- surv_model
+ 
+  
+  }
+}
+})
+
+astro_re_coefs <- astro_re_coefs[order(astro_re_coefs$p_value), ]
+
+astro_re_coefs
+
+```
+
+### Glioblastoma
+
+```{r}
+gbm_re_coefs <- data.frame(re = character(), coef= numeric(), exp_coef = numeric(), se_coef = numeric(), z= numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+gbm_model_list <- list()
+
+suppressWarnings({for (re in retroelements) { 
+  base_formula <- as.formula(paste0("Surv(Survival_months, Vital_status) ~ Age + sex + race + ", re))
+  surv_model <- coxph(base_formula, data = gbm_df)
+  p_value <- summary(surv_model)$coefficients[30]
+  
+  if (!is.na(p_value) && p_value <= 0.051) {
+        coef <- summary(surv_model)$coefficients[6]
+        exp_coef <- summary(surv_model)$coefficients[12]
+        se_coef <- summary(surv_model)$coefficients[18]
+        z <- summary(surv_model)$coefficients[24]
+        gbm_re_coefs <- rbind(gbm_re_coefs, 
+                              data.frame(re = re, coef = coef, exp_coef = exp_coef, se_coef = se_coef, z = z, p_value = p_value))
+        gbm_model_list[[re]] <- surv_model
+
+  
+  }
+}
+})
+
+gbm_re_coefs <- gbm_re_coefs[order(gbm_re_coefs$p_value), ]
+
+gbm_re_coefs
+```
+
+
+### IDH-mutant glioma, NEC
+
+```{r}
+glionec_re_coefs <- data.frame(re = character(), coef= numeric(), exp_coef = numeric(), se_coef = numeric(), z= numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+glionec_model_list <- list()
+
+suppressWarnings({for (re in retroelements) { 
+  base_formula <- as.formula(paste0("Surv(Survival_months, Vital_status) ~ Age + sex + race + who_grade + ", re))
+  surv_model <- coxph(base_formula, data = glionec_df)
+  p_value <- summary(surv_model)$coefficients[30]
+  
+  
+  if (!is.na(p_value) && p_value <= 0.1) {
+        coef <- summary(surv_model)$coefficients[6]
+        exp_coef <- summary(surv_model)$coefficients[12]
+        se_coef <- summary(surv_model)$coefficients[18]
+        z <- summary(surv_model)$coefficients[24]
+        glionec_re_coefs <- rbind(glionec_re_coefs, data.frame(re = re, coef = coef, exp_coef = exp_coef, se_coef = se_coef, z = z, p_value = p_value))
+        glionec_model_list[[re]] <- surv_model
+ 
+  
+  }
+}
+})
+
+glionec_re_coefs <- glionec_re_coefs[order(glionec_re_coefs$p_value), ]
+
+glionec_re_coefs
+
+```
+
+
+
+
+## Plots {.tabset}
+
+
+### Oligodendrogliomas, IDH-mutant
+
+```{r oligo_plot , echo=FALSE, fig.width=8, fig.height = 6 }
+oligo_plots_list <- list()
+oligo_re_list <- oligo_re_coefs$re
+  #df <- coefs$re_coefs
+  
+for (re in oligo_re_list) {
+  #re <- re_list[i,1]
+  oligo_df$tertile_count <- as.factor(percent_groups(oligo_df[re], 0.33, 0.66))
+    
+  surv_obj <- Surv(oligo_df$Survival_months, oligo_df$Vital_status)
+    
+  km_curve <- surv_fit(surv_obj ~ tertile_count, data = oligo_df)
+  plot <- ggsurvplot(km_curve, data = oligo_df, 
+                       pval = TRUE, conf.int = TRUE, 
+                       font.x = 7,
+                       risk.table=TRUE, risk.table.fontsize = 4, risk.table.height=0.3,
+                       title = paste0("KM Curve for ", re))
+    
+  oligo_plots_list[[re]] <- plot
+  print(re)
+  print(xtabs( ~ WHO2021_recode + tertile_count, data=oligo_df))
+  print(plot)
+}
+
+```
+
+
+### Astrocytomas, IDH-mutant
+
+```{r astro_plot , echo=FALSE, fig.width=8, fig.height = 6 }
+astro_plots_list <- list()
+astro_re_list <- astro_re_coefs$re
+  #df <- coefs$re_coefs
+  
+for (re in astro_re_list) {
+  #re <- re_list[i,1]
+  astro_df$tertile_count <- as.factor(percent_groups(astro_df[re], 0.33, 0.66))
+    
+  surv_obj <- Surv(astro_df$Survival_months, astro_df$Vital_status)
+    
+  km_curve <- surv_fit(surv_obj ~ tertile_count, data = astro_df)
+  plot <- ggsurvplot(km_curve, data = astro_df, 
+                       pval = TRUE, conf.int = TRUE, 
+                       font.x = 7,
+                       risk.table=TRUE, risk.table.fontsize = 4, risk.table.height=0.3,
+                       title = paste0("KM Curve for ", re))
+    
+  astro_plots_list[[re]] <- plot
+  print(re)
+  print(xtabs( ~ WHO2021_recode + tertile_count, data=astro_df))
+  print(plot)
+}
+
+```
+
+
+### Glioblastoma, IDH-wildtype
+
+```{r gbm_plot , echo=FALSE, fig.width=8, fig.height = 6 }
+gbm_plots_list <- list()
+gbm_re_list <- gbm_re_coefs$re
+  
+  
+for (re in gbm_re_list) {
+  
+  gbm_df$tertile_count <- as.factor(percent_groups(gbm_df[re], 0.33, 0.66))
+    
+  surv_obj <- Surv(gbm_df$Survival_months, gbm_df$Vital_status)
+    
+  km_curve <- surv_fit(surv_obj ~ tertile_count, data = gbm_df)
+  plot <- ggsurvplot(km_curve, data = gbm_df, 
+                       pval = TRUE, conf.int = TRUE, 
+                       font.x = 7,
+                       risk.table=TRUE, risk.table.fontsize = 4, risk.table.height=0.3,
+                       title = paste0("KM Curve for ", re))
+    
+  gbm_plots_list[[re]] <- plot
+  print(re)
+  print(xtabs( ~ WHO2021_recode + tertile_count, data=gbm_df))
+  print(plot)
+}
+
+```
+
+
+### Diffuse astrocytoma, NEC
+
+```{r glionec_plot , echo=FALSE, fig.width=8, fig.height = 6 }
+glionec_plots_list <- list()
+glionec_re_list <- glionec_re_coefs$re
+  
+  
+for (re in glionec_re_list) {
+  
+  glionec_df$tertile_count <- as.factor(percent_groups(glionec_df[re], 0.33, 0.66))
+    
+  surv_obj <- Surv(glionec_df$Survival_months, glionec_df$Vital_status)
+    
+  km_curve <- surv_fit(surv_obj ~ tertile_count, data = glionec_df)
+  plot <- ggsurvplot(km_curve, data = glionec_df, 
+                       pval = TRUE, conf.int = TRUE, 
+                       font.x = 7,
+                       risk.table=TRUE, risk.table.fontsize = 4, risk.table.height=0.3,
+                       title = paste0("KM Curve for ", re))
+    
+  glionec_plots_list[[re]] <- plot
+  print(re)
+  print(xtabs( ~ WHO2021_recode + tertile_count, data=glionec_df))
+  print(plot)
+}
+
+```
+
+
